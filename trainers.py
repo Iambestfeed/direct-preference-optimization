@@ -1,3 +1,4 @@
+%%writefile trainers.py
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn.functional as F
@@ -508,4 +509,3 @@ class TensorParallelTrainer(BasicTrainer):
     
         self.write_state_dict(self.example_counter, policy_state_dict, metrics, 'policy.pt', output_dir)
         del policy_state_dict
-        
