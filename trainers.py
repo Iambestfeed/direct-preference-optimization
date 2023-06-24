@@ -1,4 +1,3 @@
-%%writefile trainers.py
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn.functional as F
