@@ -13,10 +13,40 @@ import wandb
 import json
 import socket
 from typing import Optional, Set
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
+#import wandb
+import evaluate
+import numpy as np
+import torch
+import torch.nn as nn
+from datasets import load_dataset
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+from transformers import (
+    BitsAndBytesConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    HfArgumentParser,
+    PreTrainedTokenizerBase,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+)
+from transformers.utils import PaddingStrategy
+import bitsandbytes as bnb
 
 
 OmegaConf.register_new_resolver("get_local_run_dir", lambda exp_name, local_dirs: get_local_run_dir(exp_name, local_dirs))
 
+def find_all_linear_names(model):
+    lora_module_names = set()
+    for name, module in model.named_modules():
+        if isinstance(module, bnb.nn.Linear4bit) or \
+            isinstance(module, bnb.nn.Linear8bitLt) or \
+            isinstance(module, torch.nn.Linear):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+    print(">>> LoRA modules", lora_module_names)
 
 def worker_main(rank: int, world_size: int, config: DictConfig, policy: nn.Module, reference_model: Optional[nn.Module] = None):
     """Main function for each worker process (may be only 1 for BasicTrainer/TensorParallelTrainer)."""
@@ -75,8 +105,36 @@ def main(config: DictConfig):
     print('building policy')
     model_kwargs = {'device_map': 'balanced'} if config.trainer == 'BasicTrainer' else {}
     policy_dtype = getattr(torch, config.model.policy_dtype)
-    policy = transformers.AutoModelForCausalLM.from_pretrained(
-        config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
+    policy = AutoModelForCausalLM.from_pretrained(
+        config.model.name_or_path,
+        cache_dir=get_local_dir(config.local_dirs),
+        low_cpu_mem_usage=True, 
+        torch_dtype=policy_dtype,
+        load_in_4bit=True,
+        device_map={'':0},
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16
+        ),
+    )
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=find_all_linear_names(policy),
+        inference_mode=False,
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+    )
+
+    policy.gradient_checkpointing_enable()
+    policy = prepare_model_for_kbit_training(policy)
+    policy = get_peft_model(policy, peft_config)
+    policy.print_trainable_parameters()
+    
     disable_dropout(policy)
 
     if config.loss.name == 'dpo':
